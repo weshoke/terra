@@ -584,33 +584,55 @@ function terra.func:emitllvm(cont)
 end
 
 function terra.func:__call(...)
-    if self.fastcall then
-        return self.fastcall(...)
-    end
-    if #self.definitions == 1 then --generate fast path for the non-overloaded case
-        local defn = self.definitions[1]
-        local ptr = defn:getpointer() --forces compilation
-        local NR = #defn.type.returns
-        if NR <= 1 then
-            self.fastcall = ptr
-        else
-            self.fastcall = defn
-        end
-        return self.fastcall(...)
-    end
+	if not self.fallback_handler then
+		if self.fastcall then
+			return self.fastcall(...)
+		end
+		if #self.definitions == 1 then --generate fast path for the non-overloaded case
+			local defn = self.definitions[1]
+			local ptr = defn:getpointer() --forces compilation
+			local NR = #defn.type.returns
+			if NR <= 1 then
+				self.fastcall = ptr
+			else
+				self.fastcall = defn
+			end
+			return self.fastcall(...)
+		end
+	end
     
     local results
-    for i,v in ipairs(self.definitions) do
+    --for i,v in ipairs(self.definitions) do
+    for i=1, #self.definitions do
+    	local v = self.definitions[i]
         --TODO: this is very inefficient, we should have a routine which
         --figures out which function to call based on argument types
         results = {pcall(v.__call,v,...)}
         if results[1] == true then
-            table.remove(results,1)
+        	table.remove(results,1)
             return unpack(results)
         end
     end
+    if(self.fallback_handler) then
+    	local v = self.fallback_handler(...)
+    	if(v and terra.isfunction(v)) then
+    		local defs = v:getdefinitions()
+    		for i=1, #defs do
+	    		self:adddefinition(defs[i])
+	    	end
+			results = {pcall(v.__call,v,...)}
+			if results[1] == true then
+				table.remove(results,1)
+				return unpack(results)
+			end
+    	end
+    end
     --none of the definitions worked, remove the final error
     error(results[2])
+end
+
+function terra.func:fallback(f)
+	self.fallback_handler = f
 end
 
 function terra.func:adddefinition(v)
@@ -2002,7 +2024,6 @@ function terra.invokeuserfunction(anchor, speculate, userfn,  ...)
 end
 
 function terra.funcdefinition:typecheck()
-    
     assert(self.state == "untyped")
     local ctx = terra.getcompilecontext()
     ctx:begin(self)
