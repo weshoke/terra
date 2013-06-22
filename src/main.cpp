@@ -4,9 +4,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include "ext/getopt.h"
+#else
 #include <getopt.h>
+#endif
 #include "terra.h"
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
+
+#ifdef _WIN32
+#define isatty(x) _isatty(x)
+#endif
 
 static void printstats(lua_State * L) {
 #if 0
@@ -105,12 +119,20 @@ void parse_args(lua_State * L, int  argc, char ** argv, bool * interactive, int 
 }
 //this stuff is from lua's lua.c repl implementation:
 
+#ifndef _WIN32
 #include "linenoise.h"
 #define lua_readline(L,b,p)    ((void)L, ((b)=linenoise(p)) != NULL)
 #define lua_saveline(L,idx) \
     if (lua_strlen(L,idx) > 0)  /* non-empty line? */ \
       linenoiseHistoryAdd(lua_tostring(L, idx));  /* add it to history */
 #define lua_freeline(L,b)    ((void)L, free(b))
+#else
+#define lua_readline(L,b,p)     \
+        ((void)L, fputs(p, stdout), fflush(stdout),  /* show prompt */ \
+        fgets(b, LUA_MAXINPUT, stdin) != NULL)  /* get line */
+#define lua_saveline(L,idx)     { (void)L; (void)idx; }
+#define lua_freeline(L,b)       { (void)L; (void)b; }
+#endif
 
 static void l_message (const char *pname, const char *msg) {
   if (pname) fprintf(stderr, "%s: ", pname);
@@ -188,7 +210,6 @@ static int pushline (lua_State *L, int firstline) {
   lua_freeline(L, b);
   return 1;
 }
-
 
 static int loadline (lua_State *L) {
   int status;

@@ -10,7 +10,17 @@ extern "C" {
 }
 #include <assert.h>
 #include <stdio.h>
+
+#ifdef _WIN32
+#include <io.h>
+#include <time.h>
+#include <Windows.h>
+#undef interface
+#else
 #include <unistd.h>
+#include <sys/time.h>
+#endif
+
 #include <cmath>
 #include <sstream>
 #include "llvmheaders.h"
@@ -19,9 +29,9 @@ extern "C" {
 #include "tobj.h"
 #include "tinline.h"
 #include "llvm/Support/ManagedStatic.h"
-#include <sys/time.h>
 #include "llvm/ExecutionEngine/MCJIT.h"
 #include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/Support/Atomic.h"
 
 using namespace llvm;
 
@@ -60,9 +70,13 @@ struct DisassembleFunctionListener : public JITEventListener {
 };
 
 static double CurrentTimeInSeconds() {
+#ifdef _WIN32
+    return time(NULL);
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec + tv.tv_usec / 1000000.0;
+#endif
 }
 static int terra_currenttimeinseconds(lua_State * L) {
     lua_pushnumber(L, CurrentTimeInSeconds());
@@ -111,9 +125,40 @@ static void RegisterFunction(struct terra_State * T, const char * name, int iscl
     lua_setfield(T->L,-2,name);
 }
 
+static llvm::sys::Mutex terrainitlock;
+static int terrainitcount;
+bool OneTimeInit(struct terra_State * T) {
+    bool success = true;
+    terrainitlock.acquire();
+    terrainitcount++;
+    if(terrainitcount == 1) {
+        #ifdef PRINT_LLVM_TIMING_STATS
+            AddLLVMOptions(1,"-time-passes");
+        #endif
+
+        AddLLVMOptions(1,"-x86-asm-syntax=intel");
+        InitializeNativeTarget();
+        InitializeNativeTargetAsmPrinter();
+        InitializeNativeTargetAsmParser();
+    } else { 
+        if(!llvm_is_multithreaded()) {
+            if(!llvm_start_multithreaded()) {
+                terra_pusherror(T,"llvm failed to start multi-threading\n");
+                success = false;
+            }
+        }
+    }
+    terrainitlock.release();
+    return success;
+}
+
 int terra_compilerinit(struct terra_State * T) {
+    
     lua_getfield(T->L,LUA_GLOBALSINDEX,"terra");
     
+    if(!OneTimeInit(T))
+        return LUA_ERRRUN;
+
     #define REGISTER_FN(name,isclo) RegisterFunction(T,#name,isclo,terra_##name);
     TERRALIB_FUNCTIONS(REGISTER_FN)
     #undef REGISTER_FN
@@ -131,16 +176,7 @@ int terra_compilerinit(struct terra_State * T) {
     T->C = (terra_CompilerState*) malloc(sizeof(terra_CompilerState));
     memset(T->C, 0, sizeof(terra_CompilerState));
     
-#ifdef PRINT_LLVM_TIMING_STATS
-    AddLLVMOptions(1,"-time-passes");
-#endif
-
-    AddLLVMOptions(1,"-x86-asm-syntax=intel");
-    InitializeNativeTarget();
-    InitializeNativeTargetAsmPrinter();
-    InitializeNativeTargetAsmParser();
-    
-    T->C->ctx = &getGlobalContext();
+    T->C->ctx = new LLVMContext();
     T->C->m = new Module("terra",*T->C->ctx);
     
     TargetOptions options;
@@ -494,7 +530,7 @@ struct CCallingConv {
         } else
             assert(!"unexpected value in classification");
     }
-    
+#ifndef _WIN32
     Type * TypeForClass(size_t size, RegisterClass clz) {
         switch(clz) {
              case C_SSE:
@@ -510,6 +546,20 @@ struct CCallingConv {
                 assert(!"unexpected class");
         }
     }
+    bool ValidAggregateSize(size_t sz) {
+        return sz <= 16;
+    }
+#else
+    Type * TypeForClass(size_t size, RegisterClass clz) {
+        assert(size <= 8);
+        return Type::getIntNTy(*C->ctx, size * 8); 
+    }
+    bool ValidAggregateSize(size_t sz) {
+        bool isPow2 = sz && !(sz & (sz - 1));
+        return sz <= 8 && isPow2;
+    }
+#endif
+    
     Argument ClassifyArgument(Obj * type, int * usedfloat, int * usedint) {
         TType * t = GetType(type);
         
@@ -522,7 +572,7 @@ struct CCallingConv {
         }
         
         int sz = C->td->getTypeAllocSize(t->type);
-        if(sz > 16) {
+        if(!ValidAggregateSize(sz)) {
             return Argument(C_AGGREGATE_MEM,t->type);
         }
         
@@ -621,7 +671,9 @@ struct CCallingConv {
         for(int i = 0; i < info->paramtypes.size(); i++) {
             Argument * v = &info->paramtypes[i];
             if(v->kind == C_AGGREGATE_MEM) {
+                #ifndef _WIN32
                 r->addAttribute(argidx,ByValAttr());
+                #endif
             }
             argidx += v->nargs;
         }
@@ -1127,8 +1179,15 @@ if(baseT->isIntegerTy() || t->type->isPointerTy()) { \
         setInsertBlock(mergeB);
         return B->CreateLoad(result, "logicalop");
     }
-    
-    Value * emitPointerArith(T_Kind kind, Value * pointer, Value * number){
+    Value * emitIndex(TType * ftype, int tobits, Value * number) {
+        TType ttype;
+        memset(&ttype,0,sizeof(ttype));
+        ttype.type = Type::getIntNTy(*C->ctx,tobits);
+        ttype.issigned = ftype->issigned;
+        return emitPrimitiveCast(ftype,&ttype,number);
+    }
+    Value * emitPointerArith(T_Kind kind, Value * pointer, TType * numTy, Value * number) {
+        number = emitIndex(numTy,64,number);
         if(kind == T_add) {
             return B->CreateGEP(pointer,number);
         } else if(kind == T_sub) {
@@ -1181,7 +1240,7 @@ if(baseT->isIntegerTy() || t->type->isPointerTy()) { \
                 return emitPointerSub(t,a,b);
             } else {
                 assert(bt->type->isIntegerTy());
-                return emitPointerArith(kind, a, b);
+                return emitPointerArith(kind, a, bt, b);
             }
         }
         
@@ -1272,6 +1331,7 @@ if(baseT->isIntegerTy()) { \
             return t->type;
     }
     Value * emitPrimitiveCast(TType * from, TType * to, Value * exp) {
+        
         Type * fBase = getPrimitiveType(from);
         Type * tBase = getPrimitiveType(to);
         
@@ -1450,14 +1510,17 @@ if(baseT->isIntegerTy()) { \
                 exp->obj("value",&value);
                 exp->obj("index",&idx);
                 
+                
+                
                 Obj aggTypeO;
                 value.obj("type",&aggTypeO);
                 TType * aggType = getType(&aggTypeO);
                 Value * valueExp = emitExp(&value);
-                Value * idxExp = emitExp(&idx);
+                Value * idxExp = emitExp(&idx); 
                 
                 //if this is a vector index, emit an extractElement
                 if(aggType->type->isVectorTy()) {
+                    idxExp = emitIndex(typeOfValue(&idx),32,idxExp);
                     Value * result = B->CreateExtractElement(valueExp, idxExp);
                     if(aggType->islogical) {
                         TType * rType = typeOfValue(exp);
@@ -1465,7 +1528,7 @@ if(baseT->isIntegerTy()) { \
                     }
                     return result;
                 }
-                
+                idxExp = emitIndex(typeOfValue(&idx),64,idxExp);
                 //otherwise we have an array or pointer access, both of which will use a GEP instruction
                 
                 bool pa = exp->boolean("lvalue");
@@ -2173,6 +2236,26 @@ static int terra_disassemble(lua_State * L) {
     return 0;
 }
 
+#ifndef _WIN32
+static const char * GetTemporaryFile(char * tmpnamebuf, size_t len) {
+    const char * tmp = "/tmp/terraXXXX.o";
+    strcpy(tmpnamebuf, tmp);
+    int fd = mkstemps(tmpnamebuf,2);
+    close(fd);
+    return tmpnamebuf;
+} 
+#else
+static const char * GetTemporaryFile(char * tmpnamebuf, size_t len) {
+    char firstbuf[256];
+    DWORD tmpdirlen = GetTempPath(256, firstbuf);
+    assert(tmpdirlen < 256-14);    // Enough space in the buffer to accomodate the tmp filename
+    sprintf(&firstbuf[tmpdirlen], "terraXXXXXX");
+    _mktemp(firstbuf);
+    sprintf(tmpnamebuf, "%s.o", firstbuf);
+	return tmpnamebuf;
+}
+#endif
+
 static int terra_saveobjimpl(lua_State * L) {
     const char * filename = luaL_checkstring(L, -4);
     int tbl = lua_gettop(L) - 2;
@@ -2181,17 +2264,10 @@ static int terra_saveobjimpl(lua_State * L) {
     assert(T->L == L);
     int ref_table = lobj_newreftable(T->L);
     
-
-
-    char tmpnamebuf[20];
+    char tmpnamebuf[256];
     const char * objname = NULL;
-    
     if(isexe) {
-        const char * tmp = "/tmp/terraXXXX.o";
-        strcpy(tmpnamebuf, tmp);
-        int fd = mkstemps(tmpnamebuf,2);
-        close(fd);
-        objname = tmpnamebuf;
+        objname = GetTemporaryFile(tmpnamebuf,256);
     } else {
         objname = filename;
     }
@@ -2200,7 +2276,6 @@ static int terra_saveobjimpl(lua_State * L) {
         lua_pushvalue(L,-2);
         Obj arguments;
         arguments.initFromStack(L,ref_table);
-    
     
         std::vector<Function *> livefns;
         std::vector<std::string> names;
@@ -2236,14 +2311,19 @@ static int terra_saveobjimpl(lua_State * L) {
         M = NULL;
         
         if(isexe) {
-            sys::Path gcc = sys::Program::FindProgramByName("gcc");
-            if (gcc.isEmpty()) {
+            sys::Path linker;
+#ifndef _WIN32
+            linker = sys::Program::FindProgramByName("gcc");
+            if (linker.isEmpty()) {
                 unlink(objname);
                 terra_reporterror(T,"llvm: Failed to find gcc");
             }
+#else
+            linker = sys::Path(CLANG_EXECUTABLE);
+#endif
             
             std::vector<const char *> args;
-            args.push_back(gcc.c_str());
+            args.push_back(linker.c_str());
             args.push_back(objname);
             args.push_back("-o");
             args.push_back(filename);
@@ -2258,7 +2338,7 @@ static int terra_saveobjimpl(lua_State * L) {
             }
 
             args.push_back(NULL);
-            int c = sys::Program::ExecuteAndWait(gcc, &args[0], 0, 0, 0, 0, &err);
+            int c = sys::Program::ExecuteAndWait(linker, &args[0], 0, 0, 0, 0, &err);
             if(0 != c) {
                 unlink(objname);
                 terra_reporterror(T,"llvm: %s (%d)\n",err.c_str(),c);
@@ -2281,9 +2361,14 @@ static int terra_pointertolightuserdata(lua_State * L) {
     lua_pushlightuserdata(L, *cdata);
     return 1;
 }
+#ifdef _WIN32
+#define ISFINITE(v) _finite(v)
+#else
+#define ISFINITE(v) std::isfinite(v)
+#endif
 static int terra_isintegral(lua_State * L) {
     double v = luaL_checknumber(L,-1);
-    bool integral = std::isfinite(v) && (double)(int)v == v; 
+    bool integral = ISFINITE(v) && (double)(int)v == v; 
     lua_pushboolean(L,integral);
     return 1;
 }

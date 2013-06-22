@@ -1,5 +1,7 @@
 /* See Copyright Notice in ../LICENSE.txt */
 
+#include <stdio.h>
+
 #include "tllvmutil.h"
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm-c/Disassembler.h"

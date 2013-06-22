@@ -2478,7 +2478,7 @@ function terra.funcdefinition:typecheck()
     end
 
     local operator_table = {
-        ["-"] = { checkarithpointer, "__sub" };
+        ["-"] = { checkarithpointer, "__sub", "__unm" };
         ["+"] = { checkarithpointer, "__add" };
         ["*"] = { checkarith, "__mul" };
         ["/"] = { checkarith, "__div" };
@@ -2511,7 +2511,8 @@ function terra.funcdefinition:typecheck()
             return ee:copy { type = ty, operands = terra.newlist{e} }
         end
         
-        local op, overloadmethod = unpack(operator_table[op_string] or {})
+        local op, genericoverloadmethod, unaryoverloadmethod = unpack(operator_table[op_string] or {})
+        
         if op == nil then
             diag:reporterror(ee,"operator ",op_string," not defined in terra code.")
             return ee:copy { type = terra.types.error }
@@ -2521,6 +2522,7 @@ function terra.funcdefinition:typecheck()
         local overloads = terra.newlist()
         for i,e in ipairs(operands) do
             if e.type:isstruct() then
+                local overloadmethod = (#operands == 1 and unaryoverloadmethod) or genericoverloadmethod
                 local overload = e.type.metamethods[overloadmethod] --TODO: be more intelligent here about merging overloaded functions so that all possibilities are considered
                 if overload then
                     overloads:insert(terra.createterraexpression(diag, ee, overload))
@@ -3641,7 +3643,7 @@ function terra.funcdefinition:printpretty()
     end
 
     local prectable = makeprectable(
-     "+",7,"-",7,"*",7,"/",8,"%",8,
+     "+",7,"-",7,"*",8,"/",8,"%",8,
      "^",11,"..",6,"<<",4,">>",4,
      "==",3,"<",3,"<=",3,
      "~=",3,">",3,">=",3,

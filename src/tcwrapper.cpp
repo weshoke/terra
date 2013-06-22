@@ -522,7 +522,7 @@ static int dofile(terra_State * T, const char * code, const char ** argbegin, co
     llvm::MemoryBuffer * membuffer = llvm::MemoryBuffer::getMemBufferCopy(buffer, "<buffer>");
     initializeclang(T, membuffer, argbegin, argend, &TheCompInst);
                                            
-    CodeGenerator * codegen = CreateLLVMCodeGen(TheCompInst.getDiagnostics(), "mymodule", TheCompInst.getCodeGenOpts(), llvm::getGlobalContext() );
+    CodeGenerator * codegen = CreateLLVMCodeGen(TheCompInst.getDiagnostics(), "mymodule", TheCompInst.getCodeGenOpts(), *T->C->ctx );
 
     ParseAST(TheCompInst.getPreprocessor(),
             codegen,
@@ -575,6 +575,14 @@ int include_c(lua_State * L) {
         args.push_back(*cpaths);
         cpaths++;
     }
+
+#ifdef _WIN32
+	args.push_back("-fms-extensions");
+	args.push_back("-fms-compatibility");
+#define __stringify(x) #x
+#define __indirect(x) __stringify(x)
+	args.push_back("-fmsc-version=" __indirect(_MSC_VER));
+#endif
     
     args.push_back("-I");
     args.push_back(TERRA_CLANG_RESOURCE_DIRECTORY);
