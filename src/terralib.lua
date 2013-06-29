@@ -28,6 +28,7 @@ end
 debug.sethook(debughook,"l")
 ]]
 
+local debug = require"debug"
 local ffi = require("ffi")
 
 terra.isverbose = 0 --set by C api
@@ -568,7 +569,6 @@ end
 -- a function is a list of possible function definitions that can be invoked
 -- it is implemented this way to support function overloading, where the same symbol
 -- may have different definitions
-
 terra.func = {} --metatable for all function types
 terra.func.__index = terra.func
 
@@ -628,6 +628,7 @@ function terra.func:__call(...)
     	end
     end
     --none of the definitions worked, remove the final error
+    print(self.name, ...)
     error(results[2])
 end
 
@@ -638,6 +639,7 @@ end
 function terra.func:adddefinition(v)
     self.fastcall = nil
     self.definitions:insert(v)
+    v.parent = self
 end
 
 function terra.func:getdefinitions()
@@ -2209,7 +2211,7 @@ function terra.funcdefinition:typecheck()
             print(debug.traceback())
         end
         if typ == exp.type or typ == terra.types.error or exp.type == terra.types.error then
-            return exp, true
+            return exp, true, true
         else
             local cast_exp = createcast(exp,typ)
             if ((typ:isprimitive() and exp.type:isprimitive()) or
@@ -2575,10 +2577,12 @@ function terra.funcdefinition:typecheck()
         return param
     end
 
-    local function tryinsertcasts(typelists,castbehavior, speculate, allowambiguous, paramlist)
+    local function tryinsertcasts(typelists, castbehavior, speculate, allowambiguous, paramlist)
+    	local didcast = false
         local minsize, maxsize = paramlist.minsize, #paramlist.expressions
         local function trylist(typelist, speculate)
             local allvalid = true
+            local nocast = true
             if #typelist > maxsize then
                 allvalid = false
                 if not speculate then
@@ -2596,7 +2600,7 @@ function terra.funcdefinition:typecheck()
             for i,param in ipairs(paramlist.expressions) do
                 local typ = typelist[i]
                 
-                local result,valid
+                local result,valid,cast
                 if typ == nil or typ == "passthrough" then
                     result,valid = param,true 
                 elseif castbehavior == "all" or (i == 1 and castbehavior == "first") then
@@ -2604,13 +2608,14 @@ function terra.funcdefinition:typecheck()
                 elseif typ == "vararg" then
                     result,valid = insertvarargpromotions(param),true
                 else
-                    result,valid = insertcast(param,typ,speculate)
+                    result,valid,cast = insertcast(param,typ,speculate)
+                    nocast = nocast and cast
                 end
                 results[i] = result
                 allvalid = allvalid and valid
             end
             
-            return results,allvalid
+            return results,allvalid,not nocast
         end
         
         local function shortenparamlist(size)
@@ -2624,20 +2629,21 @@ function terra.funcdefinition:typecheck()
 
         if #typelists == 1 then
             local typelist = typelists[1]    
-            local results,allvalid = trylist(typelist,false)
+            local results,allvalid,wascast = trylist(typelist,false)
             assert(#results == maxsize)
             paramlist.expressions = results
             shortenparamlist(#typelist)
-            return 1
+            return 1, wascast
         else
             --evaluate each potential list
             local valididx,validcasts
             for i,typelist in ipairs(typelists) do
-                local results,allvalid = trylist(typelist,true)
+                local results,allvalid,wascast = trylist(typelist,true)
                 if allvalid then
                     if valididx == nil then
                         valididx = i
                         validcasts = results
+                        didcast = wascast
                         if allowambiguous then
                             break
                         end
@@ -2663,7 +2669,7 @@ function terra.funcdefinition:typecheck()
                     end
                 end
             end
-            return valididx
+            return valididx, didcast
         end
     end
     
@@ -2732,7 +2738,7 @@ function terra.funcdefinition:typecheck()
         return checkcall(exp, terra.newlist { fnlike } , arguments, "none", false, isstatement)
     end
     
-    function checkcall(anchor, fnlikelist, arguments, castbehavior, allowambiguous, isstatement)
+    function checkcall(anchor, fnlikelist, arguments, castbehavior, allowambiguous, isstatement, recursive)
         --arguments are always typedexpressions or luaobjects
         for i,a in ipairs(arguments) do
             assert(a:is "typedexpressionlist")
@@ -2745,6 +2751,7 @@ function terra.funcdefinition:typecheck()
         --we will call the macro/luafunction (these can take any argument types so they will always work)
         local terrafunctions = terra.newlist()
         local fnlike = nil
+        local hasfallback = false
         for i,fn in ipairs(fnlikelist) do
             if fn:is "luaobject" then
                 if terra.ismacro(fn.value) or type(fn.value) == "function" then
@@ -2758,8 +2765,29 @@ function terra.funcdefinition:typecheck()
                     break
                 elseif terra.isfunction(fn.value) then
                     if #fn.value:getdefinitions() == 0 then
-                        diag:reporterror(anchor,"attempting to call undefined function")
+						if(fn.value.fallback_handler) then
+							local types = {}
+							for i=1, #arguments do
+								local tree = arguments[i]
+								types[i] = tree.expressions[1].type
+							end
+                    		local v = fn.value.fallback_handler(unpack(types))
+                    		if(v and terra.isfunction(v)) then
+								local defs = v:getdefinitions()
+								for i=1, #defs do
+									fn.value:adddefinition(defs[i])
+								end
+							end
+                    	end
+                    	if #fn.value:getdefinitions() == 0 then
+	                        diag:reporterror(anchor,"attempting to call undefined function")
+	                    end
                     end
+                    
+                    if(fn.value.fallback_handler) then
+                    	hasfallback = true
+                    end
+                    
                     for i,v in ipairs(fn.value:getdefinitions()) do
                         local fnlit = createfunctionliteral(anchor,v)
                         if fnlit.type ~= terra.types.error then
@@ -2819,7 +2847,39 @@ function terra.funcdefinition:typecheck()
                 return vatypes
             end
             local typelists = terrafunctions:map(getparametertypes)
-            local valididx = tryinsertcasts(typelists,castbehavior, fnlike ~= nil, allowambiguous, paramlist)
+            
+            local types = {}
+			for i=1, #paramlist.expressions do
+				types[i] = paramlist.expressions[i].type
+			end
+            
+            local flag
+            if(type(recursive) == "boolean") then
+            	flag = false
+            else
+            	flag = true
+            end
+			local valididx, didcast = tryinsertcasts(typelists,castbehavior, flag, allowambiguous, paramlist)
+           	if(
+           		(not recursive and hasfallback and didcast and not fnlike) or
+				(not valididx and not fnlike)
+           	) then
+				for i=1, #terrafunctions do
+					local tf = terrafunctions[i]
+					local func = tf.value.parent
+					if(func and func.fallback_handler) then
+						local v = func.fallback_handler(unpack(types))
+						if(v and terra.isfunction(v)) then
+							local defs = v:getdefinitions()
+							for i=1, #defs do
+								func:adddefinition(defs[i])
+							end
+							return checkcall(anchor, fnlikelist, arguments, castbehavior, allowambiguous, isstatement, true)
+						end
+					end
+				end
+				valididx = tryinsertcasts(typelists,castbehavior, fnlike ~= nil, allowambiguous, paramlist)
+			end
             if valididx then
                 return createcall(terrafunctions[valididx],paramlist)
             end
