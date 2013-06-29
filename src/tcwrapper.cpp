@@ -34,34 +34,20 @@ public:
     IncludeCVisitor(Rewriter &R, std::stringstream & o, Obj * res)
         : TheRewriter(R),
           output(o),
-          result(res),
+          resulttable(res),
           L(res->getState()),
           ref_table(res->getRefTable()) {
         
-        //create a table to hold the error messages for this import
-        lua_newtable(L);
-        error_table.initFromStack(L,ref_table);
-        
-        
-        
+        //create tables for errors messages, general namespace, and the tagged namespace
+        InitTable(&error_table,"errors");
+        InitTable(&general,"general");
+        InitTable(&tagged,"tagged");
     }
-
-    void SetMetatable() {
-        result->push(); //to set metatable later
-        
-        //set the metatable for result to fire includetableindex when a thing wasn't found
-        lua_newtable(L); //metatable
-        lua_getfield(L, LUA_GLOBALSINDEX, "terra");
-        lua_getfield(L, -1, "includetableindex");
-        lua_remove(L,-2);
-        lua_setfield(L, -2, "__index");
-        error_table.push();
-        lua_setfield(L,-2,"errors");
-        
-        
-        lua_setmetatable(L, -2);
-        
-        lua_pop(L,1); //remove result table
+    void InitTable(Obj * tbl, const char * name) {
+        lua_newtable(L);
+        tbl->initFromStack(L, ref_table);
+        tbl->push();
+        resulttable->setfield(name);
     }
     
     void InitType(const char * name, Obj * tt) {
@@ -110,7 +96,76 @@ public:
         }
         return !opaque;
 
-    } 
+    }
+    
+    bool GetRecordTypeFromDecl(RecordDecl * rd, Obj * tt, std::string * fullname) {
+        if(rd->isStruct() || rd->isUnion()) {
+            std::string name = rd->getName();
+            //TODO: why do some types not have names?
+            Obj * thenamespace = &tagged;
+            if(name == "") {
+                TypedefNameDecl * decl = rd->getTypedefNameForAnonDecl();
+                if(decl) {
+                    thenamespace = &general;
+                    name = decl->getName();
+                } else {
+                    name = "anon";
+                }
+            }
+
+            assert(name != "");
+
+            if(!thenamespace->obj(name.c_str(),tt)) {
+                //create new blank struct, fill in with members
+                PushTypeFunction("newstruct");
+                lua_pushstring(L, name.c_str());
+                lua_call(L,1,1);
+                tt->initFromStack(L,ref_table);
+                tt->push();
+                thenamespace->setfield(name.c_str()); //register the type (this prevents an infinite loop for recursive types)
+                
+                std::stringstream ss;
+                ss << (rd->isStruct() ? "struct." : "union.") << name;
+                lua_pushstring(L,ss.str().c_str());
+                tt->setfield("llvm_name");
+                lua_pushboolean(L, true);
+                tt->setfield("undefined");
+            }
+            
+            if(tt->boolean("undefined") && rd->getDefinition() != NULL) {
+                tt->clearfield("undefined");
+                RecordDecl * defn = rd->getDefinition();
+                Obj entries;
+                tt->newlist(&entries);
+                if(GetFields(defn, &entries)) {
+                    if(!defn->isUnion()) {
+                        //structtype.entries = {entry1, entry2, ... }
+                        entries.push();
+                        tt->setfield("entries");
+                    } else {
+                        //add as a union:
+                        //structtype.entries = { {entry1,entry2,...} }
+                        Obj allentries;
+                        tt->obj("entries",&allentries);
+                        entries.push();
+                        allentries.addentry();
+                    }
+                }
+            }
+            
+            if(fullname) {
+                std::stringstream ss;
+                if(thenamespace == &tagged)
+                    ss << (rd->isStruct() ? "struct " : "union ");
+                ss << name;
+                *fullname = ss.str();
+            }
+            
+            return true;
+        } else {
+            return ImportError("non-struct record types are not supported");
+        }
+    }
 
     bool GetType(QualType T, Obj * tt) {
         
@@ -121,63 +176,7 @@ public:
           case Type::Record: {
             const RecordType *RT = dyn_cast<RecordType>(Ty);
             RecordDecl * rd = RT->getDecl();
-            if(rd->isStruct() || rd->isUnion()) {
-                std::string name = rd->getName();
-                //TODO: why do some types not have names?
-                
-                if(name == "") {
-                    TypedefNameDecl * decl = rd->getTypedefNameForAnonDecl();
-                    if(decl) { 
-                        name = decl->getName();
-                    } else {
-                        name = "anon";
-                    }
-                }
-
-                assert(name != "");
-
-                if(!result->obj(name.c_str(),tt)) {
-                    //create new blank struct, fill in with members
-                    PushTypeFunction("newstruct");
-                    lua_pushstring(L, name.c_str());
-                    lua_call(L,1,1);
-                    tt->initFromStack(L,ref_table);
-                    tt->push();
-                    result->setfield(name.c_str()); //register the type (this prevents an infinite loop for recursive types)
-                    
-                    Obj entries;
-                    tt->newlist(&entries);
-                    if(GetFields(rd, &entries)) {
-                        if(!rd->isUnion()) {
-                            //structtype.entries = {entry1, entry2, ... }
-                            entries.push();
-                            tt->setfield("entries");
-                        } else {
-                            //add as a union:
-                            //structtype.entries = { {entry1,entry2,...} }
-                            Obj allentries;
-                            tt->obj("entries",&allentries);
-                            entries.push();
-                            allentries.addentry();
-                        }
-                    }
-
-                    std::stringstream ss;
-                    if(rd->isStruct())
-                        ss << "struct.";
-                    else if(rd->isUnion())
-                        ss << "union.";
-                    else
-                        assert(!"not struct or union?");
-                    ss << name.c_str();
-                    
-                    lua_pushstring(L,ss.str().c_str());
-                    tt->setfield("llvm_name");
-                }
-                return true;
-            } else {
-                return ImportError("non-struct record types are not supported");
-            }
+            return GetRecordTypeFromDecl(rd, tt,NULL);
           }  break; //TODO
           case Type::Builtin:
             switch (cast<BuiltinType>(Ty)->getKind()) {
@@ -310,6 +309,10 @@ public:
         lua_pushstring(L,error_message.c_str());
         error_table.setfield(field);
     }
+    void KeepTypeLive(llvm::StringRef name) {
+         //make sure it stays live through llvm translation
+        output << "(void)(" << name.str() << "*) (void*) 0;\n";
+    }
     bool VisitTypedefDecl(TypedefDecl * TD) {
         if(TD == TD->getCanonicalDecl() && TD->getDeclContext()->getDeclKind() == Decl::TranslationUnit) {
             llvm::StringRef name = TD->getName();
@@ -317,11 +320,20 @@ public:
             Obj typ;
             if(GetType(QT,&typ)) {
                 typ.push();
-                result->setfield(name.str().c_str());
-                //make sure it stays live
-                output << "(void)(" << name.str() << "*) (void*) 0;\n";
+                general.setfield(name.str().c_str());
+               KeepTypeLive(name);
             } else {
                 SetErrorReport(name.str().c_str());
+            }
+        }
+        return true;
+    }
+    bool VisitRecordDecl(RecordDecl * rd) {
+        if(rd->getDeclContext()->getDeclKind() == Decl::TranslationUnit) {
+            Obj type;
+            std::string name;
+            if(GetRecordTypeFromDecl(rd, &type,&name)) {
+                KeepTypeLive(name);
             }
         }
         return true;
@@ -329,8 +341,8 @@ public:
     
     bool GetFuncType(const FunctionType * f, Obj * typ) {
         Obj returns,parameters;
-        result->newlist(&returns);
-        result->newlist(&parameters);
+        resulttable->newlist(&returns);
+        resulttable->newlist(&parameters);
         
         bool valid = true; //decisions about whether this function can be exported or not are delayed until we have seen all the potential problems
         QualType RT = f->getResultType();
@@ -410,20 +422,22 @@ public:
         lua_pushstring(L, internalname.c_str());
         typ->push();
         lua_call(L, 2, 1);
-        result->setfield(name.c_str());
+        general.setfield(name.c_str());
     }
     void SetContext(ASTContext * ctx) {
         Context = ctx;
     }
-    ~IncludeCVisitor() { SetMetatable(); } //setting the metatable must be done after type resolution, or attempts to find if types have been initialized will cause name not found errors
-private:
+  private:
     std::stringstream & output;
     Rewriter &TheRewriter;
-    Obj * result;
+    Obj * resulttable; //holds table returned to lua includes "functions", "types", and "errors"
     lua_State * L;
     int ref_table;
     ASTContext * Context;
-    Obj error_table;
+    Obj error_table; //name -> related error message
+    Obj general; //name -> function or type in the general namespace
+    Obj tagged; //name -> type in the tagged namespace (e.g. struct Foo)
+    
     std::string error_message;
 };
 
